@@ -11,6 +11,7 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import video.api.flutter.livestream.utils.addTrailingSlashIfNeeded
 import video.api.flutter.livestream.utils.toAudioConfig
+import video.api.flutter.livestream.utils.toAudioEffectFlags
 import video.api.flutter.livestream.utils.toVideoConfig
 
 class MethodCallHandlerImpl(
@@ -92,7 +93,12 @@ class MethodCallHandlerImpl(
             "setAudioConfig" -> {
                 try {
                     @Suppress("UNCHECKED_CAST")
-                    val audioConfig = (call.arguments as Map<String, Any>).toAudioConfig()
+                    val raw = call.arguments as Map<String, Any>
+                    val audioConfig = raw.toAudioConfig()
+                    // Forward the AEC / NS flags so the next MicrophoneSourceFactory
+                    // is built with the right effect set (3.x moved these
+                    // off AudioConfig and onto the source factory).
+                    flutterView!!.setAudioEffects(raw.toAudioEffectFlags())
                     flutterView!!.setAudioConfig(
                         audioConfig,
                         { result.success(null) },

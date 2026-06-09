@@ -3,8 +3,11 @@ version '1.0-SNAPSHOT'
 
 buildscript {
     ext {
-        kotlin_version = '1.9.22'
-        streamPackVersion = '2.6.0'
+        kotlin_version = '2.0.21'
+        // StreamPack 3.1.0+ rewrote RTMP in pure Kotlin (no prebuilt
+        // librtmp / libssl / libcrypto .so files), which removes the
+        // Play Store 16 KB page-size blocker that 2.x had.
+        streamPackVersion = '3.1.2'
     }
     repositories {
         google()
@@ -12,7 +15,7 @@ buildscript {
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.2.2'
+        classpath 'com.android.tools.build:gradle:8.5.2'
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
     }
 }
@@ -28,7 +31,7 @@ apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
 
 android {
-    compileSdk 34
+    compileSdk 35
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
@@ -39,24 +42,26 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = '1.8'
+        jvmTarget = '17'
     }
 
     namespace "video.api.flutter.livestream"
 }
 
 dependencies {
-    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
-    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
-    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
 
-    implementation "io.github.thibaultbee:streampack:$streamPackVersion"
-    implementation "io.github.thibaultbee:streampack-extension-rtmp:$streamPackVersion"
+    // StreamPack 3.x is split into multiple artifacts.
+    implementation "io.github.thibaultbee.streampack:streampack-core:$streamPackVersion"
+    implementation "io.github.thibaultbee.streampack:streampack-rtmp:$streamPackVersion"
 }
