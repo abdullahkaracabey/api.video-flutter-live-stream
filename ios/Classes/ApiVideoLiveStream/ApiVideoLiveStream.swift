@@ -170,7 +170,7 @@ public class ApiVideoLiveStream {
         self.rtmpStream.videoSettings = VideoCodecSettings(videoSize: .init(width: 1_280, height: 720))
 
         #if os(iOS)
-        if let orientation = DeviceUtil.videoOrientation(by: UIApplication.shared.statusBarOrientation) {
+        if let orientation = DeviceUtil.videoOrientation(by: Self.interfaceOrientation) {
             self.rtmpStream.videoOrientation = orientation
         }
         #endif
@@ -462,9 +462,56 @@ public class ApiVideoLiveStream {
     }
 
     #if os(iOS)
+    /// Fork: the window scene's orientation. The pod read
+    /// `UIApplication.statusBarOrientation`, which a UIScene app cannot rely
+    /// on: under it the capture stayed portrait while the interface had
+    /// turned to landscape, and a portrait picture went out stretched across
+    /// a 16:9 frame.
+    private static var interfaceOrientation: UIInterfaceOrientation {
+        if #available(iOS 13.0, *), let scene = Self.windowScene {
+            return scene.interfaceOrientation
+        }
+        return UIApplication.shared.statusBarOrientation
+    }
+
+    @available(iOS 13.0, *)
+    private static var windowScene: UIWindowScene? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+    }
+
+    /// Fork: whether the interface may turn to `orientation` right now — the
+    /// app's own orientation lock, as the root view controller reports it.
+    private static func interfaceAllows(_ orientation: AVCaptureVideoOrientation) -> Bool {
+        let window: UIWindow?
+        if #available(iOS 13.0, *) {
+            let windows = Self.windowScene?.windows ?? []
+            window = windows.first { $0.isKeyWindow } ?? windows.first
+        } else {
+            window = UIApplication.shared.keyWindow
+        }
+        // The app-wide set is Info.plist's; the lock a screen asks for (Flutter's
+        // setPreferredOrientations) lives on the root view controller.
+        var allowed = UIApplication.shared.supportedInterfaceOrientations(for: window)
+        if let root = window?.rootViewController {
+            allowed.formIntersection(root.supportedInterfaceOrientations)
+        }
+        // AVCaptureVideoOrientation and UIInterfaceOrientation share raw
+        // values, and each mask bit is 1 << that value.
+        let mask = UIInterfaceOrientationMask(rawValue: 1 << UInt(orientation.rawValue))
+        return allowed.contains(mask)
+    }
+
     @objc
     private func orientationDidChange(_: Notification) {
-        guard let orientation = DeviceUtil.videoOrientation(by: UIApplication.shared.statusBarOrientation) else {
+        // Fork: the device turns first and the interface follows, so the
+        // interface read here can still be the orientation it is leaving, and
+        // a turn from one landscape to the other would keep the old one —
+        // upside down. Follow the device instead, but only where the
+        // interface can follow it too: a phone held upright under a
+        // landscape-locked screen keeps the landscape capture.
+        guard let orientation = DeviceUtil.videoOrientation(by: UIDevice.current.orientation),
+              Self.interfaceAllows(orientation) else {
             return
         }
 
