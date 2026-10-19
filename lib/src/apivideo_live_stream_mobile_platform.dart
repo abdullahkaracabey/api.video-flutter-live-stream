@@ -129,6 +129,10 @@ class ApiVideoMobileLiveStreamPlatform extends ApiVideoLiveStreamPlatform {
           return LiveStreamingEvent(
               type: LiveStreamingEventType.videoSizeChanged,
               data: Size(event['width'] as double, event['height'] as double));
+        case 'bandwidth':
+          return LiveStreamingEvent(
+              type: LiveStreamingEventType.bandwidth,
+              data: BandwidthStats.fromMap(event));
         default:
           return LiveStreamingEvent(type: LiveStreamingEventType.unknown);
       }

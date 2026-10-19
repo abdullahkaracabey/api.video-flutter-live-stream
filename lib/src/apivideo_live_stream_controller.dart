@@ -43,7 +43,8 @@ class ApiVideoLiveStreamController {
       VoidCallback? onConnectionSuccess,
       Function(String)? onConnectionFailed,
       VoidCallback? onDisconnection,
-      Function(Exception)? onError})
+      Function(Exception)? onError,
+      Function(BandwidthStats)? onBandwidth})
       : _initialVideoConfig = initialVideoConfig,
         _initialAudioConfig = initialAudioConfig,
         _initialCameraPosition = initialCameraPosition {
@@ -51,7 +52,8 @@ class ApiVideoLiveStreamController {
         onConnectionSuccess: onConnectionSuccess,
         onConnectionFailed: onConnectionFailed,
         onDisconnection: onDisconnection,
-        onError: onError));
+        onError: onError,
+        onBandwidth: onBandwidth));
   }
 
   ApiVideoLiveStreamController.fromListener(
@@ -257,6 +259,13 @@ class ApiVideoLiveStreamController {
           }
         }
         break;
+      case LiveStreamingEventType.bandwidth:
+        for (var listener in [..._eventsListeners]) {
+          if (listener.onBandwidth != null) {
+            listener.onBandwidth!(event.data as BandwidthStats);
+          }
+        }
+        break;
       case LiveStreamingEventType.unknown:
         // Nothing to do
         break;
@@ -280,12 +289,16 @@ class ApiVideoLiveStreamEventsListener {
   /// Gets notified when an error occurs
   final Function(Exception)? onError;
 
+  /// Gets notified about once a second while streaming of the uplink's state
+  final Function(BandwidthStats)? onBandwidth;
+
   ApiVideoLiveStreamEventsListener(
       {this.onConnectionSuccess,
       this.onConnectionFailed,
       this.onDisconnection,
       this.onVideoSizeChanged,
-      this.onError});
+      this.onError,
+      this.onBandwidth});
 }
 
 class ApiVideoLiveStreamWidgetListener {

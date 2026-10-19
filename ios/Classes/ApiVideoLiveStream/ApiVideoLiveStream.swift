@@ -25,6 +25,16 @@ public class ApiVideoLiveStream {
     private var isAudioConfigured = false
     private var isVideoConfigured = false
 
+    /// Fork: the video bitrate the host chose. HaishinKit's adaptive strategy
+    /// lowers the encoder below it when the uplink cannot keep up, and climbs
+    /// back towards it once it can.
+    private var maxVideoBitrate = 0
+
+    /// Fork: HaishinKit's last verdict on the uplink. It only gives one when
+    /// the send queue grew on every sample (insufficient) or on none
+    /// (sufficient); in between, the last verdict stands.
+    private var isBandwidthSufficient = true
+
     /// The delegate of the ApiVideoLiveStream
     public weak var delegate: ApiVideoLiveStreamDelegate?
 
@@ -146,6 +156,11 @@ public class ApiVideoLiveStream {
 
         // https://stackoverflow.com/questions/51010390/avaudiosession-setcategory-swift-4-2-ios-12-play-sound-on-silent
         try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+        // Fork: iOS mutes vibration while the microphone records, which
+        // silenced the host's weak-connection alert for the whole broadcast.
+        if #available(iOS 13.0, *) {
+            try? session.setAllowHapticsAndSystemSoundsDuringRecording(true)
+        }
         try session.setActive(true)
         #endif
 
@@ -183,6 +198,8 @@ public class ApiVideoLiveStream {
 
         self.rtmpConnection.addEventListener(.rtmpStatus, selector: #selector(self.rtmpStatusHandler), observer: self)
         self.rtmpConnection.addEventListener(.ioError, selector: #selector(self.rtmpErrorHandler), observer: self)
+        // Fork: bandwidth verdicts and per-second stats.
+        self.rtmpConnection.delegate = self
 
         #if os(iOS)
         NotificationCenter.default.addObserver(
@@ -335,6 +352,12 @@ public class ApiVideoLiveStream {
             profileLevel: kVTProfileLevel_H264_Baseline_5_2 as String,
             maxKeyFrameIntervalDuration: Int32(videoConfig.gopDuration)
         )
+        // Fork: let HaishinKit lower the bitrate on a weak uplink instead of
+        // queueing frames the connection cannot carry, which froze viewers.
+        self.maxVideoBitrate = videoConfig.bitrate
+        self.rtmpStream.bitrateStrategy = IOStreamVideoAdaptiveNetBitRateStrategy(
+            mamimumVideoBitrate: videoConfig.bitrate
+        )
 
         self.isVideoConfigured = true
     }
@@ -373,6 +396,7 @@ public class ApiVideoLiveStream {
 
         self.streamKey = streamKey
         self.url = url
+        self.isBandwidthSufficient = true
 
         self.rtmpConnection.connect(url)
     }
@@ -488,6 +512,37 @@ public protocol ApiVideoLiveStreamDelegate: AnyObject {
 
     /// Called if an error happened during the video configuration
     func videoError(_ error: Error)
+
+    /// Fork: called about once a second while publishing.
+    /// - Parameters:
+    ///   - sufficient: whether the uplink keeps up with what the encoder makes
+    ///   - sentBitsPerSecond: what actually left the phone in the last second
+    ///   - videoBitrate: the encoder's current video bitrate
+    ///   - maxVideoBitrate: the video bitrate the host chose
+    func bandwidthUpdated(sufficient: Bool, sentBitsPerSecond: Int, videoBitrate: Int, maxVideoBitrate: Int)
+}
+
+// Fork: RTMPConnection's delegate, which the pod never set.
+extension ApiVideoLiveStream: RTMPConnectionDelegate {
+    public func connection(_ connection: RTMPConnection, publishInsufficientBWOccured stream: RTMPStream) {
+        self.isBandwidthSufficient = false
+    }
+
+    public func connection(_ connection: RTMPConnection, publishSufficientBWOccured stream: RTMPStream) {
+        self.isBandwidthSufficient = true
+    }
+
+    public func connection(_ connection: RTMPConnection, updateStats stream: RTMPStream) {
+        guard stream === self.rtmpStream else {
+            return
+        }
+        self.delegate?.bandwidthUpdated(
+            sufficient: self.isBandwidthSufficient,
+            sentBitsPerSecond: Int(connection.currentBytesOutPerSecond) * 8,
+            videoBitrate: stream.videoSettings.bitRate,
+            maxVideoBitrate: self.maxVideoBitrate
+        )
+    }
 }
 
 extension AVCaptureVideoOrientation {

@@ -144,4 +144,15 @@ extension FlutterLiveStreamView: ApiVideoLiveStreamDelegate {
     func videoError(_ error: Error) {
         print("video error: \(error)")
     }
+
+    /// Called about once a second while publishing
+    func bandwidthUpdated(sufficient: Bool, sentBitsPerSecond: Int, videoBitrate: Int, maxVideoBitrate: Int) {
+        sendEvent([
+            "type": "bandwidth",
+            "sufficient": sufficient,
+            "sentBitsPerSecond": sentBitsPerSecond,
+            "videoBitrate": videoBitrate,
+            "maxVideoBitrate": maxVideoBitrate,
+        ])
+    }
 }

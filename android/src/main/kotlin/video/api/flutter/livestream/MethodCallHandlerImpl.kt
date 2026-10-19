@@ -58,7 +58,8 @@ class MethodCallHandlerImpl(
                         { sendDisconnected() },
                         { sendConnectionFailed(it) },
                         { sendError(it) },
-                        { sendVideoSizeChanged(it) }
+                        { sendVideoSizeChanged(it) },
+                        { sendBandwidth(it) }
                     )
                     result.success(mapOf("textureId" to flutterView!!.textureId))
                 } catch (e: Exception) {
@@ -275,6 +276,20 @@ class MethodCallHandlerImpl(
                     "type" to "videoSizeChanged",
                     "width" to resolution.width.toDouble(),
                     "height" to resolution.height.toDouble() // Dart size fields are in double
+                )
+            )
+        }
+    }
+
+    private fun sendBandwidth(sample: BandwidthSample) {
+        Handler(Looper.getMainLooper()).post {
+            eventSink?.success(
+                mapOf(
+                    "type" to "bandwidth",
+                    "sufficient" to sample.sufficient,
+                    "sentBitsPerSecond" to sample.sentBitsPerSecond,
+                    "videoBitrate" to sample.videoBitrate,
+                    "maxVideoBitrate" to sample.maxVideoBitrate
                 )
             )
         }

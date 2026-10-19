@@ -71,15 +71,20 @@ class FlutterLiveStreamView(
     private val onConnectionFailed: (String) -> Unit,
     private val onGenericError: (Exception) -> Unit,
     private val onVideoSizeChanged: (Size) -> Unit,
+    private val onBandwidth: (BandwidthSample) -> Unit,
 ) {
     private val flutterTexture = textureRegistry.createSurfaceTexture()
     val textureId: Long
         get() = flutterTexture.id()
 
+    /** What the encoders produced, against which the uplink is measured. */
+    private val produced = ProducedBytes()
+
     private val streamer = SingleStreamer(
         context = context,
         withAudio = true,
-        withVideo = true
+        withVideo = true,
+        endpointFactory = MeteredEndpoint.Factory(produced)
     )
 
     /**
@@ -128,6 +133,12 @@ class FlutterLiveStreamView(
                 ?: context.cameraManager.defaultCameraId)
 
     init {
+        // Measures the uplink once a second while streaming and lowers the
+        // video bitrate when it cannot keep up. Started and stopped by the
+        // streamer with each stream.
+        streamer.addBitrateRegulatorController(
+            UplinkBitrateRegulatorController.Factory(produced, onBandwidth)
+        )
         // isOpenFlow: track connection lifecycle. Drop the initial
         // value so the first emission (false, before we ever opened)
         // is ignored.

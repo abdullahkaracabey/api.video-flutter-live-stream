@@ -119,6 +119,9 @@ enum LiveStreamingEventType {
   /// The video size has changed.
   videoSizeChanged,
 
+  /// About once a second while streaming: the uplink's [BandwidthStats].
+  bandwidth,
+
   /// Unknown event
   unknown
 }

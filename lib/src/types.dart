@@ -1,4 +1,5 @@
 export 'types/audio_config.dart';
+export 'types/bandwidth_stats.dart';
 export 'types/camera_position.dart';
 export 'types/channel.dart';
 export 'types/resolution.dart';
