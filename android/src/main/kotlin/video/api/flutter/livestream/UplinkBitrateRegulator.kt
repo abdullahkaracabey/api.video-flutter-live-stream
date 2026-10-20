@@ -82,8 +82,12 @@ data class BandwidthSample(
 /**
  * Watches the uplink once a second while streaming, lowers the video bitrate
  * when it cannot keep up and climbs back once it can — the Android
- * counterpart of HaishinKit's `IOStreamVideoAdaptiveNetBitRateStrategy`,
- * which the iOS side uses.
+ * counterpart of the iOS side's `SteadyAdaptiveBitRateStrategy`, with the
+ * same rules: nothing is judged in the first [GRACE_SECONDS] of a stream,
+ * while TCP ramps up and the first keyframes go out; the bitrate drops only
+ * after [LOWER_AFTER] bad verdicts in a row, by a quarter to a half towards
+ * what went out; it climbs a tenth of the maximum after [RAISE_AFTER_SECONDS]
+ * good ones.
  *
  * "Sent" is the app's own transmitted bytes from [TrafficStats], which also
  * counts the TLS and RTMP overhead and the app's other (small) traffic while
@@ -95,6 +99,8 @@ class UplinkBitrateRegulatorController(
     private val produced: ProducedBytes,
     dispatcher: CoroutineDispatcher,
     private val onSample: (BandwidthSample) -> Unit,
+    /** Logs every sample, for testing on a throttled connection. Debug builds only. */
+    private val debugLogging: Boolean = false,
 ) : IBitrateRegulatorController {
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private var job: Job? = null
@@ -106,6 +112,7 @@ class UplinkBitrateRegulatorController(
             var lastProduced = produced.total
             var lastSent = TrafficStats.getUidTxBytes(Process.myUid())
             var sufficient = true
+            var insufficientRun = 0
             var sufficientSeconds = 0
             var lastLoweredAt = 0L
             var tick = 0L
@@ -122,7 +129,6 @@ class UplinkBitrateRegulatorController(
                 }
                 val sentBits = (sentNow - lastSent) * 8
                 lastSent = sentNow
-                window.add(producedBits, sentBits)
 
                 val videoEncoder =
                     (pipelineOutput as? IConfigurableVideoEncodingPipelineOutput)?.videoEncoder
@@ -131,27 +137,41 @@ class UplinkBitrateRegulatorController(
                     (pipelineOutput as? IConfigurableAudioEncodingPipelineOutput)?.audioEncoder?.bitrate
                         ?: 0
                 val maxVideoBitrate = videoEncoder.startBitrate
+                val inGrace = tick <= GRACE_SECONDS
 
-                if (window.isFull) {
-                    if (window.sent < window.produced * INSUFFICIENT_RATIO) {
-                        sufficient = false
-                    } else if (window.sent >= window.produced * SUFFICIENT_RATIO) {
-                        sufficient = true
+                if (inGrace) {
+                    // Judged from what comes after, not the ramp-up.
+                    window.clear()
+                } else {
+                    window.add(producedBits, sentBits)
+                    if (window.isFull) {
+                        if (window.sent < window.produced * INSUFFICIENT_RATIO) {
+                            sufficient = false
+                            insufficientRun++
+                        } else if (window.sent >= window.produced * SUFFICIENT_RATIO) {
+                            sufficient = true
+                            insufficientRun = 0
+                        }
                     }
                 }
 
                 try {
-                    if (!sufficient) {
+                    if (inGrace) {
                         sufficientSeconds = 0
-                        // One step at a time: after a change, the next window
-                        // still holds the old rate.
-                        if (tick - lastLoweredAt >= WINDOW_SECONDS) {
-                            val target = (sentBits - audioBitrate).toInt()
+                    } else if (!sufficient) {
+                        sufficientSeconds = 0
+                        // After a change, the next window still holds the old
+                        // rate, so wait one out.
+                        if (insufficientRun >= LOWER_AFTER && tick - lastLoweredAt >= WINDOW_SECONDS) {
+                            val current = videoEncoder.bitrate
+                            val towards = (sentBits - audioBitrate).toInt().coerceAtLeast(current / 2)
+                            val target = minOf(current * 3 / 4, towards)
                                 .coerceAtLeast(maxVideoBitrate / 10)
                                 .coerceAtLeast(MIN_VIDEO_BITRATE)
-                            if (target < videoEncoder.bitrate) {
+                            if (target < current) {
                                 videoEncoder.bitrate = target
                                 lastLoweredAt = tick
+                                insufficientRun = 0
                                 window.clear()
                             }
                         }
@@ -170,9 +190,16 @@ class UplinkBitrateRegulatorController(
                     Log.w(TAG, "Bitrate change failed", t)
                 }
 
+                if (debugLogging) {
+                    Log.d(
+                        TAG,
+                        "[bandwidth] sent=$sentBits produced=$producedBits video=${videoEncoder.bitrate}/$maxVideoBitrate " +
+                            "sufficient=$sufficient grace=$inGrace"
+                    )
+                }
                 onSample(
                     BandwidthSample(
-                        sufficient = sufficient,
+                        sufficient = inGrace || sufficient,
                         sentBitsPerSecond = sentBits.toInt(),
                         videoBitrate = videoEncoder.bitrate,
                         maxVideoBitrate = maxVideoBitrate,
@@ -219,12 +246,19 @@ class UplinkBitrateRegulatorController(
     class Factory(
         private val produced: ProducedBytes,
         private val onSample: (BandwidthSample) -> Unit,
+        private val debugLogging: Boolean = false,
     ) : IBitrateRegulatorController.Factory {
         override fun newBitrateRegulatorController(
             pipelineOutput: IEncodingPipelineOutput,
             coroutineDispatcher: CoroutineDispatcher
         ): IBitrateRegulatorController =
-            UplinkBitrateRegulatorController(pipelineOutput, produced, coroutineDispatcher, onSample)
+            UplinkBitrateRegulatorController(
+                pipelineOutput,
+                produced,
+                coroutineDispatcher,
+                onSample,
+                debugLogging
+            )
     }
 
     companion object {
@@ -233,6 +267,12 @@ class UplinkBitrateRegulatorController(
 
         /** Seconds summed for a verdict. */
         private const val WINDOW_SECONDS = 3
+
+        /** Seconds after the stream starts that are not judged: TCP ramping up and the first keyframes. */
+        private const val GRACE_SECONDS = 8
+
+        /** Bad verdicts in a row before the bitrate drops; the app's warning waits for as many. */
+        private const val LOWER_AFTER = 2
 
         /** Below this share of what was produced getting out, the uplink is not keeping up. */
         private const val INSUFFICIENT_RATIO = 0.85

@@ -2,6 +2,7 @@ package video.api.flutter.livestream
 
 import android.Manifest
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.media.audiofx.AudioEffect
 import android.util.Log
 import android.util.Size
@@ -137,7 +138,11 @@ class FlutterLiveStreamView(
         // video bitrate when it cannot keep up. Started and stopped by the
         // streamer with each stream.
         streamer.addBitrateRegulatorController(
-            UplinkBitrateRegulatorController.Factory(produced, onBandwidth)
+            UplinkBitrateRegulatorController.Factory(
+                produced,
+                onBandwidth,
+                debugLogging = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+            )
         )
         // isOpenFlow: track connection lifecycle. Drop the initial
         // value so the first emission (false, before we ever opened)

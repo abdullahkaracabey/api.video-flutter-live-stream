@@ -35,6 +35,10 @@ public class ApiVideoLiveStream {
     /// (sufficient); in between, the last verdict stands.
     private var isBandwidthSufficient = true
 
+    /// Fork: lowers and raises the video bitrate; see
+    /// [SteadyAdaptiveBitRateStrategy].
+    private var adaptiveStrategy: SteadyAdaptiveBitRateStrategy?
+
     /// The delegate of the ApiVideoLiveStream
     public weak var delegate: ApiVideoLiveStreamDelegate?
 
@@ -352,12 +356,12 @@ public class ApiVideoLiveStream {
             profileLevel: kVTProfileLevel_H264_Baseline_5_2 as String,
             maxKeyFrameIntervalDuration: Int32(videoConfig.gopDuration)
         )
-        // Fork: let HaishinKit lower the bitrate on a weak uplink instead of
-        // queueing frames the connection cannot carry, which froze viewers.
+        // Fork: lower the bitrate on a weak uplink instead of queueing frames
+        // the connection cannot carry, which froze viewers.
         self.maxVideoBitrate = videoConfig.bitrate
-        self.rtmpStream.bitrateStrategy = IOStreamVideoAdaptiveNetBitRateStrategy(
-            mamimumVideoBitrate: videoConfig.bitrate
-        )
+        let strategy = SteadyAdaptiveBitRateStrategy(mamimumVideoBitrate: videoConfig.bitrate)
+        self.adaptiveStrategy = strategy
+        self.rtmpStream.bitrateStrategy = strategy
 
         self.isVideoConfigured = true
     }
@@ -440,6 +444,9 @@ public class ApiVideoLiveStream {
             self.rtmpStream.publish(self.streamKey)
 
         case RTMPStream.Code.publishStart.rawValue:
+            // Fork: a fresh connection gets its grace period.
+            self.adaptiveStrategy?.restart()
+            self.isBandwidthSufficient = true
             self.delegate?.connectionSuccess()
 
         case RTMPConnection.Code.connectClosed.rawValue:
@@ -572,6 +579,10 @@ public protocol ApiVideoLiveStreamDelegate: AnyObject {
 // Fork: RTMPConnection's delegate, which the pod never set.
 extension ApiVideoLiveStream: RTMPConnectionDelegate {
     public func connection(_ connection: RTMPConnection, publishInsufficientBWOccured stream: RTMPStream) {
+        // A connection still getting up to speed is not a weak one.
+        if self.adaptiveStrategy?.isInGrace == true {
+            return
+        }
         self.isBandwidthSufficient = false
     }
 
@@ -583,12 +594,106 @@ extension ApiVideoLiveStream: RTMPConnectionDelegate {
         guard stream === self.rtmpStream else {
             return
         }
+        #if DEBUG
+        NSLog(
+            "[bandwidth] sent=%d bit/s video=%d/%d bit/s sufficient=%@ grace=%@",
+            Int(connection.currentBytesOutPerSecond) * 8,
+            stream.videoSettings.bitRate,
+            self.maxVideoBitrate,
+            self.isBandwidthSufficient ? "yes" : "no",
+            self.adaptiveStrategy?.isInGrace == true ? "yes" : "no"
+        )
+        #endif
         self.delegate?.bandwidthUpdated(
             sufficient: self.isBandwidthSufficient,
             sentBitsPerSecond: Int(connection.currentBytesOutPerSecond) * 8,
             videoBitrate: stream.videoSettings.bitRate,
             maxVideoBitrate: self.maxVideoBitrate
         )
+    }
+}
+
+/// Fork: the bitrate strategy, replacing HaishinKit's
+/// IOStreamVideoAdaptiveNetBitRateStrategy. That one cut the bitrate to what
+/// went out in the last second on a single "insufficient" verdict — and at
+/// the start of a stream, with TCP still ramping up and the first keyframes
+/// queued, little goes out. On "Hoch" one such verdict took the bitrate to a
+/// fraction of the chosen one, where it then crept back 10 % per 15 s, while
+/// the connection had been fine all along.
+///
+/// This one waits [graceInterval] after each publish start, lowers only after
+/// [lowerAfter] verdicts in a row (the same the app's warning waits for), and
+/// then by a quarter to a half per step, towards what actually went out.
+/// Raising is HaishinKit's: a tenth of the maximum after [raiseAfter] good
+/// verdicts in a row. The Android regulator follows the same rules.
+final class SteadyAdaptiveBitRateStrategy: IOStreamBitRateStrategyConvertible {
+    static let graceInterval: TimeInterval = 8
+    static let lowerAfter = 2
+    static let raiseAfter = 15
+    static let minimumVideoBitRate = 300_000
+
+    weak var stream: IOStream?
+    let mamimumVideoBitRate: Int
+    let mamimumAudioBitRate: Int = 0
+
+    private var graceUntil = Date.distantPast
+    private var insufficientRun = 0
+    private var sufficientRun = 0
+
+    init(mamimumVideoBitrate: Int) {
+        self.mamimumVideoBitRate = mamimumVideoBitrate
+    }
+
+    var isInGrace: Bool {
+        Date() < graceUntil
+    }
+
+    func setUp() {
+        stream?.videoSettings.bitRate = mamimumVideoBitRate
+        restart()
+    }
+
+    /// A new connection: give it [graceInterval] to get up to speed.
+    func restart() {
+        graceUntil = Date().addingTimeInterval(Self.graceInterval)
+        insufficientRun = 0
+        sufficientRun = 0
+    }
+
+    func sufficientBWOccured(_ stats: IOStreamBitRateStats) {
+        insufficientRun = 0
+        guard let stream, stream.videoSettings.bitRate < mamimumVideoBitRate else {
+            sufficientRun = 0
+            return
+        }
+        sufficientRun += 1
+        if Self.raiseAfter <= sufficientRun {
+            stream.videoSettings.bitRate = min(
+                stream.videoSettings.bitRate + mamimumVideoBitRate / 10,
+                mamimumVideoBitRate
+            )
+            sufficientRun = 0
+        }
+    }
+
+    func insufficientBWOccured(_ stats: IOStreamBitRateStats) {
+        sufficientRun = 0
+        guard let stream, !isInGrace else {
+            return
+        }
+        insufficientRun += 1
+        guard Self.lowerAfter <= insufficientRun else {
+            return
+        }
+        insufficientRun = 0
+        let current = stream.videoSettings.bitRate
+        let sent = Int(stats.currentBytesOutPerSecond) * 8 - stream.audioSettings.bitRate
+        let floor = max(mamimumVideoBitRate / 10, Self.minimumVideoBitRate)
+        // Towards what went out, but by a quarter at least and half at most.
+        let target = max(min(current * 3 / 4, max(sent, current / 2)), floor)
+        if target < current {
+            stream.videoSettings.bitRate = target
+        }
     }
 }
 
