@@ -10,6 +10,8 @@
 import AVFoundation
 import Foundation
 import HaishinKit
+import Network
+import os.log
 #if !os(macOS)
 import UIKit
 #endif
@@ -30,14 +32,50 @@ public class ApiVideoLiveStream {
     /// back towards it once it can.
     private var maxVideoBitrate = 0
 
-    /// Fork: HaishinKit's last verdict on the uplink. It only gives one when
-    /// the send queue grew on every sample (insufficient) or on none
-    /// (sufficient); in between, the last verdict stands.
-    private var isBandwidthSufficient = true
+    /// Fork: the verdict on the uplink, reached afresh every second; see
+    /// [UplinkJudge].
+    private let uplinkJudge = UplinkJudge()
 
     /// Fork: lowers and raises the video bitrate; see
     /// [SteadyAdaptiveBitRateStrategy].
     private var adaptiveStrategy: SteadyAdaptiveBitRateStrategy?
+
+    /// Fork: watches for the network the stream went out on to go away.
+    /// iOS never moves an open TCP connection to another interface: with the
+    /// Wi-Fi switched off, the stream's connection is dead while the phone is
+    /// online again over mobile data, and viewers see a frozen picture.
+    private let pathMonitor = NWPathMonitor()
+
+    /// Fork: the network's last state, from [pathMonitor]. Main queue.
+    private var currentPath: NWPath?
+
+    /// Fork: between publishing starting and the connection closing. Main
+    /// queue.
+    private var isPublishing = false
+
+    /// Fork: the interface the stream went out on when publishing started —
+    /// the path's preferred one at that moment. Main queue.
+    private var publishInterface: NWInterface?
+
+    /// Fork: seconds in a row nothing went out while publishing. Main queue.
+    private var stalledSeconds = 0
+
+    /// Fork: set when the fork itself closed the connection and has already
+    /// reported the disconnection, so a late close event from HaishinKit is
+    /// not reported a second time — the app would start two reconnects.
+    private var isDropping = false
+
+    /// Fork: seconds of nothing going out after which the connection counts
+    /// as dead. A live stream always sends: the audio alone never stops.
+    private static let stalledAfter = 5
+
+    /// Fork: fires when a connection is up but its publish has not started;
+    /// see [startPublishWatchdog]. Main queue.
+    private var publishWatchdog: DispatchWorkItem?
+
+    /// Fork: how long publishing may take to start once connected. Mux
+    /// answers within a second or two.
+    private static let publishTimeout: TimeInterval = 10
 
     /// The delegate of the ApiVideoLiveStream
     public weak var delegate: ApiVideoLiveStreamDelegate?
@@ -204,6 +242,11 @@ public class ApiVideoLiveStream {
         self.rtmpConnection.addEventListener(.ioError, selector: #selector(self.rtmpErrorHandler), observer: self)
         // Fork: bandwidth verdicts and per-second stats.
         self.rtmpConnection.delegate = self
+        // Fork: drop a connection whose network has gone; see [pathMonitor].
+        self.pathMonitor.pathUpdateHandler = { [weak self] path in
+            self?.pathDidChange(path)
+        }
+        self.pathMonitor.start(queue: .main)
 
         #if os(iOS)
         NotificationCenter.default.addObserver(
@@ -286,6 +329,7 @@ public class ApiVideoLiveStream {
     }
 
     deinit {
+        pathMonitor.cancel()
         #if os(iOS)
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
         #endif
@@ -400,14 +444,17 @@ public class ApiVideoLiveStream {
 
         self.streamKey = streamKey
         self.url = url
-        self.isBandwidthSufficient = true
+        self.isDropping = false
 
+        logConnection("startStreaming: connected=\(self.rtmpConnection.connected)")
         self.rtmpConnection.connect(url)
     }
 
     /// Stop your livestream
     /// - Returns: Void
     public func stopStreaming() {
+        self.cancelPublishWatchdog()
+        self.stopWatchingConnection()
         let isConnected = self.rtmpConnection.connected
         self.rtmpConnection.close()
         if isConnected {
@@ -439,18 +486,34 @@ public class ApiVideoLiveStream {
             print("rtmpStatusHandler: failed to parse event: \(e)")
             return
         }
+        logConnection("status \(code) (\(level)) dropping=\(self.isDropping)")
         switch code {
         case RTMPConnection.Code.connectSuccess.rawValue:
+            DispatchQueue.main.async {
+                self.startPublishWatchdog()
+            }
             self.rtmpStream.publish(self.streamKey)
 
         case RTMPStream.Code.publishStart.rawValue:
             // Fork: a fresh connection gets its grace period.
             self.adaptiveStrategy?.restart()
-            self.isBandwidthSufficient = true
+            DispatchQueue.main.async {
+                self.cancelPublishWatchdog()
+                self.startWatchingConnection()
+            }
             self.delegate?.connectionSuccess()
 
         case RTMPConnection.Code.connectClosed.rawValue:
-            self.delegate?.disconnection()
+            // Fork: on the main queue, where a drop of the fork's own is
+            // decided, so the two cannot both report the same connection.
+            DispatchQueue.main.async {
+                self.cancelPublishWatchdog()
+                self.stopWatchingConnection()
+                guard !self.isDropping else {
+                    return
+                }
+                self.delegate?.disconnection()
+            }
 
         default:
             if level == "error" {
@@ -463,9 +526,83 @@ public class ApiVideoLiveStream {
     private func rtmpErrorHandler(_ notification: Notification) {
         let e = Event.from(notification)
         print("rtmpErrorHandler: \(e)")
+        logConnection("ioError, reconnecting natively: connected=\(self.rtmpConnection.connected)")
         DispatchQueue.main.async {
             self.rtmpConnection.connect(self.url)
         }
+    }
+
+    /// Fork: a fresh connection is publishing; start judging it from scratch.
+    private func startWatchingConnection() {
+        self.isPublishing = true
+        self.publishInterface = self.currentPath?.availableInterfaces.first
+        self.stalledSeconds = 0
+        self.uplinkJudge.reset()
+    }
+
+    /// Fork: gives up on a connection whose publish does not start. After the
+    /// Wi-Fi went, Mux had not noticed the old connection die and left a new
+    /// publish on the same stream key unanswered: connected, never publishing,
+    /// and nothing ever said so — the host was left reconnecting for good. A
+    /// later attempt gets through once Mux has let the old one go.
+    private func startPublishWatchdog() {
+        self.publishWatchdog?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+            self.publishWatchdog = nil
+            logConnection("publish did not start within \(Self.publishTimeout) s; giving up on this connection")
+            self.isDropping = true
+            self.rtmpConnection.close()
+            self.delegate?.connectionFailed("publish timed out")
+        }
+        self.publishWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.publishTimeout, execute: watchdog)
+    }
+
+    private func cancelPublishWatchdog() {
+        self.publishWatchdog?.cancel()
+        self.publishWatchdog = nil
+    }
+
+    private func stopWatchingConnection() {
+        self.isPublishing = false
+        self.publishInterface = nil
+        self.stalledSeconds = 0
+    }
+
+    /// Fork: drops the connection once the interface it went out on is gone
+    /// and the phone is online over another, so the app reconnects over that
+    /// one at once rather than sending into a dead connection. A path with no
+    /// network at all is left alone: there is nothing to reconnect over yet,
+    /// and the stall check catches a connection that does not come back.
+    private func pathDidChange(_ path: NWPath) {
+        self.currentPath = path
+        logConnection(
+            "path \(path.status) interfaces=\(path.availableInterfaces.map(\.name).joined(separator: ","))"
+                + " publishing=\(self.isPublishing) over=\(self.publishInterface?.name ?? "-")"
+        )
+        guard self.isPublishing,
+              let interface = self.publishInterface,
+              path.status == .satisfied,
+              !path.availableInterfaces.contains(where: { $0.name == interface.name }) else {
+            return
+        }
+        self.dropConnection("\(interface.name) is gone")
+    }
+
+    /// Fork: closes a connection that can no longer carry the stream and
+    /// reports it as a disconnection, which the app answers with a reconnect.
+    private func dropConnection(_ reason: String) {
+        guard self.isPublishing else {
+            return
+        }
+        logConnection("dropping the connection: \(reason)")
+        self.stopWatchingConnection()
+        self.isDropping = true
+        self.rtmpConnection.close()
+        self.delegate?.disconnection()
     }
 
     #if os(iOS)
@@ -578,38 +715,94 @@ public protocol ApiVideoLiveStreamDelegate: AnyObject {
 
 // Fork: RTMPConnection's delegate, which the pod never set.
 extension ApiVideoLiveStream: RTMPConnectionDelegate {
-    public func connection(_ connection: RTMPConnection, publishInsufficientBWOccured stream: RTMPStream) {
-        // A connection still getting up to speed is not a weak one.
-        if self.adaptiveStrategy?.isInGrace == true {
-            return
-        }
-        self.isBandwidthSufficient = false
-    }
+    // HaishinKit's verdicts drive the bitrate through
+    // [SteadyAdaptiveBitRateStrategy]; what the host is told is
+    // [UplinkJudge]'s, reached in updateStats.
+    public func connection(_ connection: RTMPConnection, publishInsufficientBWOccured stream: RTMPStream) {}
 
-    public func connection(_ connection: RTMPConnection, publishSufficientBWOccured stream: RTMPStream) {
-        self.isBandwidthSufficient = true
-    }
+    public func connection(_ connection: RTMPConnection, publishSufficientBWOccured stream: RTMPStream) {}
 
+    /// Once a second, on the main queue.
     public func connection(_ connection: RTMPConnection, updateStats stream: RTMPStream) {
         guard stream === self.rtmpStream else {
             return
         }
+        let sentBitsPerSecond = Int(connection.currentBytesOutPerSecond) * 8
+        let queueBytesOut = connection.previousQueueBytesOut.last ?? 0
+        // A connection still getting up to speed is not a weak one.
+        let isInGrace = self.adaptiveStrategy?.isInGrace == true
+        let sufficient: Bool
+        if isInGrace {
+            self.uplinkJudge.reset()
+            sufficient = true
+        } else {
+            sufficient = self.uplinkJudge.judge(
+                queueBytesOut: queueBytesOut,
+                sentBitsPerSecond: sentBitsPerSecond
+            )
+        }
+        if self.isPublishing && !isInGrace && sentBitsPerSecond == 0 {
+            self.stalledSeconds += 1
+        } else {
+            self.stalledSeconds = 0
+        }
         #if DEBUG
         NSLog(
-            "[bandwidth] sent=%d bit/s video=%d/%d bit/s sufficient=%@ grace=%@",
-            Int(connection.currentBytesOutPerSecond) * 8,
+            "[bandwidth] sent=%d bit/s queue=%lld B video=%d/%d bit/s sufficient=%@ grace=%@ stalled=%d",
+            sentBitsPerSecond,
+            queueBytesOut,
             stream.videoSettings.bitRate,
             self.maxVideoBitrate,
-            self.isBandwidthSufficient ? "yes" : "no",
-            self.adaptiveStrategy?.isInGrace == true ? "yes" : "no"
+            sufficient ? "yes" : "no",
+            isInGrace ? "yes" : "no",
+            self.stalledSeconds
         )
         #endif
         self.delegate?.bandwidthUpdated(
-            sufficient: self.isBandwidthSufficient,
-            sentBitsPerSecond: Int(connection.currentBytesOutPerSecond) * 8,
+            sufficient: sufficient,
+            sentBitsPerSecond: sentBitsPerSecond,
             videoBitrate: stream.videoSettings.bitRate,
             maxVideoBitrate: self.maxVideoBitrate
         )
+        if Self.stalledAfter <= self.stalledSeconds {
+            self.dropConnection("nothing sent for \(self.stalledSeconds) s")
+        }
+    }
+}
+
+/// Fork: whether the uplink keeps up, judged afresh every second from the
+/// send queue. HaishinKit gives a verdict only when the queue grew on every
+/// one of its last samples (insufficient) or on none (sufficient), and none
+/// in between. Its "insufficient" from a bad spell then stood for as long as
+/// the queue moved both ways, and the host's warning stayed up on a
+/// connection that had recovered.
+///
+/// Here a second is bad when nothing went out, or when the queue has grown on
+/// each of the last [growingSeconds] seconds; any other second is good. The
+/// app turns its warning on and off only after a few seconds alike in a row.
+final class UplinkJudge {
+    static let growingSeconds = 2
+
+    /// The queue at the last [growingSeconds] + 1 seconds, oldest first.
+    private var queue: [Int64] = []
+
+    func reset() {
+        queue.removeAll()
+    }
+
+    func judge(queueBytesOut: Int64, sentBitsPerSecond: Int) -> Bool {
+        queue.append(queueBytesOut)
+        if Self.growingSeconds + 1 < queue.count {
+            queue.removeFirst()
+        }
+        if sentBitsPerSecond == 0 {
+            return false
+        }
+        guard Self.growingSeconds < queue.count else {
+            return true
+        }
+        let isGrowing = zip(queue, queue.dropFirst()).allSatisfy { $0 < $1 }
+        return !isGrowing
     }
 }
 
@@ -706,4 +899,11 @@ extension AVCaptureVideoOrientation {
 public enum LiveStreamError: Error {
     case IllegalArgumentError(String)
     case IllegalOperationError(String)
+}
+
+/// Fork: connection events in the device log. NSLog's text shows only as
+/// <private> in a release build, which is the only kind that keeps running
+/// once the Wi-Fi is switched off for a test.
+private func logConnection(_ message: String) {
+    os_log("[connection] %{public}@", message)
 }
